@@ -1,7 +1,7 @@
-// src/components/QuillEditor.jsx
+// src/components/SimpleEditor.jsx
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import 'quill/dist/quill.snow.css';
-import './QuillEditor.css';
+import './SimpleEditor.css';
 import {setupChineseItalicSupport} from '../utils/ChineseItalicSupport.js';
 
 // 自定义图片上传模块
@@ -41,7 +41,7 @@ const debounce = (func, wait) => {
   };
 };
 
-function QuillEditor() {
+function SimpleEditor() {
   const editorRef = useRef(null);
   const quillInstanceRef = useRef(null);
   const [wordCount, setWordCount] = useState(0);
@@ -107,37 +107,111 @@ function QuillEditor() {
       const mainContainer = document.createElement('div');
       mainContainer.className = 'quill-main-container';
 
+      // 自定义工具栏容器
       const toolbarContainer = document.createElement('div');
-      toolbarContainer.id = 'quill-toolbar-' + Date.now();
-      toolbarContainer.className = 'quill-toolbar-container';
+      toolbarContainer.id = 'custom-toolbar-' + Date.now();
+      toolbarContainer.className = 'custom-toolbar';
+
+      // 添加自定义工具栏按钮
+      toolbarContainer.innerHTML = `
+      <div class="toolbar-group">
+        <select class="ql-header">
+          <option value="1">标题 1</option>
+          <option value="2">标题 2</option>
+          <option value="3">标题 3</option>
+          <option value="4">标题 4</option>
+          <option value="5">标题 5</option>
+          <option value="6">标题 6</option>
+          <option selected>正文</option>
+        </select>
+        <select class="ql-font">
+          <option value="sans-serif">sans-serif</option>
+          <option value="serif">serif</option>
+          <option value="monospace">monospace</option>
+        </select>
+        <select class="ql-size">
+          <option value="small">小号</option>
+          <option value="normal" selected>正常</option>
+          <option value="large">大号</option>
+          <option value="huge">巨大</option>
+        </select>
+      </div>
+      <div class="toolbar-group">
+        <button type="button" class="ql-bold" title="粗体 (Ctrl+B)">
+          <span>B</span>
+        </button>
+        <button type="button" class="ql-italic" title="斜体">
+          <span><i>I</i></span>
+        </button>
+        <button type="button" class="ql-underline" title="下划线">
+          <span><u>U</u></span>
+        </button>
+        <button type="button" class="ql-strike" title="删除线">
+          <span>S</span>
+        </button>
+      </div>
+      
+      <div class="toolbar-group">
+        <button type="button" class="ql-list" value="ordered" title="有序列表">
+          <span>1.</span>
+        </button>
+        <button type="button" class="ql-list" value="bullet" title="无序列表">
+          <span>•</span>
+        </button>
+        <button type="button" class="ql-indent" value="-1" title="减少缩进">
+          <span>←</span>
+        </button>
+        <button type="button" class="ql-indent" value="+1" title="增加缩进">
+          <span>→</span>
+        </button>
+      </div>
+      <div class="toolbar-group">
+        <button type="button" class="ql-link" title="链接">
+          <span>🔗</span>
+        </button>
+        <button type="button" class="ql-image" title="插入图片">
+          <span>🖼️</span>
+        </button>
+        <button type="button" class="ql-video" title="插入视频">
+          <span>🎬</span>
+        </button>
+        <button type="button" class="ql-code-block" title="代码块">
+          <span>&lt;/&gt;</span>
+        </button>
+      </div>
+      <div class="toolbar-group">
+        <button type="button" class="ql-align" value=""></button>
+        <button type="button" class="ql-align" value="center"></button>
+        <button type="button" class="ql-align" value="right"></button>
+        <button type="button" class="ql-align" value="justify"></button>
+      </div>
+      <div class="toolbar-group">
+        <button type="button" class="ql-clean" title="清除格式">
+          <span>🗑️</span>
+        </button>
+        <button type="button" class="custom-save" title="保存">
+          <span>💾</span>
+        </button>
+      </div>
+    `;
+
       mainContainer.appendChild(toolbarContainer);
 
+      const container = document.createElement('div');
+      container.className= 'container';
       const editorContainer = document.createElement('div');
       editorContainer.className = 'quill-editor-container';
-      mainContainer.appendChild(editorContainer);
+      container.appendChild(editorContainer);
+      mainContainer.appendChild(container);
 
       editorRef.current.appendChild(mainContainer);
-
-      // 工具栏配置
-      const toolbarOptions = [
-        [{ 'header': [1, 2, 3, 4, 5, 6, false] }],
-        ['bold', 'italic', 'underline', 'strike'],
-        [{ 'script': 'sub' }, { 'script': 'super' }],
-        [{ 'color': [] }, { 'background': [] }],
-        [{ 'align': [] }],
-        ['blockquote', 'code-block'],
-        [{ 'list': 'ordered' }, { 'list': 'bullet' }, { 'list': 'check' }],
-        [{ 'indent': '-1' }, { 'indent': '+1' }],
-        ['link', 'image', 'video', 'formula'],
-        ['clean']
-      ];
 
       // 初始化 Quill
       quillInstanceRef.current = new Quill(editorContainer, {
         theme: 'snow',
         modules: {
           toolbar: {
-            container: toolbarOptions,
+            container: toolbarContainer, // 使用自定义工具栏容器
             handlers: {
               image: function() {
                 ImageUploadHandler.clickHandler().then((imageUrl) => {
@@ -177,7 +251,15 @@ function QuillEditor() {
         placeholder: '开始写作...',
         readOnly: false
       });
-
+      // 为自定义保存按钮添加事件
+      toolbarContainer.querySelector('.custom-save').addEventListener('click', () => {
+        if (quillInstanceRef.current) {
+          const content = quillInstanceRef.current.root.innerHTML;
+          console.log('保存内容:', content);
+          alert('内容已保存！');
+          // 这里可以调用保存 API
+        }
+      });
       // ========== 优化事件监听 ==========
 
       // 1. 创建防抖的文本变化处理器
@@ -249,18 +331,19 @@ function QuillEditor() {
 
   return (
     <div className="simple-editor-container">
-      <div className="editor-header">
-        <h2>原生 Quill 编辑器</h2>
+      <div>
+
+      </div>
+      <div ref={editorRef} className="quill-editor-wrapper"></div>
+      <div className="editor-trailer">
         <div className="editor-stats">
           <span className="stat-item">字数: {wordCount}</span>
           <span className="stat-item">字符: {charCount}</span>
           <span className="stat-item">状态: {isInitialized ? '✅ 已加载' : '🔄 加载中'}</span>
         </div>
       </div>
-
-      <div ref={editorRef} className="quill-editor-wrapper"></div>
     </div>
   );
 }
 
-export default QuillEditor;
+export default SimpleEditor;

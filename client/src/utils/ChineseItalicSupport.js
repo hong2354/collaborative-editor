@@ -1,3 +1,5 @@
+//client/src/utils/ChineseItalicSupport.js
+
 export const setupChineseItalicSupport = () => {
   // 添加全局样式
   if (!document.querySelector('#chinese-font-support')) {
