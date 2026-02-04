@@ -3,6 +3,11 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import 'quill/dist/quill.snow.css';
 import './SimpleEditor.css';
 import {setupChineseItalicSupport} from '../utils/ChineseItalicSupport.js';
+import ShareDBClient from '../utils/sharedb-client';
+
+//导入socket.io-client
+import {io} from 'socket.io-client';
+
 
 // 自定义图片上传模块
 const ImageUploadHandler = {
@@ -44,63 +49,186 @@ const debounce = (func, wait) => {
 function SimpleEditor() {
   const editorRef = useRef(null);
   const quillInstanceRef = useRef(null);
+
+  //Socket 相关状态
+  const socketRef = useRef(null);
+  const connectionStatusRef = useRef('disconnected');
+  const isEditorConnectedRef = useRef(false);
+
+  const [socket, setSocket] = useState(null);
+  const [connectionStatus, setConnectionStatus] = useState('disconnected');
+  const [isEditorConnected, setIsEditorConnected] = useState(false);
+
   const [wordCount, setWordCount] = useState(0);
   const [charCount, setCharCount] = useState(0);
   const [isInitialized, setIsInitialized] = useState(false);
 
-  // 使用 ref 来存储内容，避免频繁触发状态更新
-  const contentRef = useRef('');
 
-  // 更新统计的函数 - 使用 useCallback 并固定依赖
+  const updateSocket = useCallback((socket) => {
+    socketRef.current = socket;
+    setSocket(socket);
+    console.log(`socket更新: ${socket} (ref: ${socketRef.current})`);
+  }, []);
+
+  const updateConnectionStatus = useCallback((status) => {
+    connectionStatusRef.current = status;
+    setConnectionStatus(status);
+    console.log(`连接状态更新: ${status} (ref: ${connectionStatusRef.current})`);
+  }, []);
+
+  const updateIsEditorConnected = useCallback((connected) => {
+    isEditorConnectedRef.current = connected;
+    setIsEditorConnected(connected);
+    console.log(`编辑器连接状态更新: ${connected} (ref: ${isEditorConnectedRef.current})`);
+  }, []);
+
+
+  // **初始化 Socket 连接**
+  const initSocket = useCallback(() => {
+    console.log('正在连接到 Socket.IO 服务器...');
+
+    const newSocket = io('http://localhost:5000', {
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+    });
+
+    // 连接成功事件
+    newSocket.on('connect', () => {
+      console.log('✅ Socket.IO 连接成功！Socket ID:', newSocket.id);
+      updateConnectionStatus('connected');
+      updateIsEditorConnected(true);
+      console.log('ConnectionStatus:',connectionStatusRef.current);
+      console.log('isEditorConnected:',isEditorConnectedRef.current);
+      // 发送编辑器就绪消息
+      newSocket.emit('editor-ready', {
+        clientId: newSocket.id,
+        type: 'editor',
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    // 🔄 **接收编辑器内容变化**
+    newSocket.on('editor-change', (data) => {
+      console.log('📩 收到编辑器变化:', data);
+
+      // 应用变化到本地编辑器（如果不是本地触发的）
+      if (quillInstanceRef.current && data.clientId !== newSocket.id) {
+        console.log('应用远程变化到编辑器');
+        applyRemoteChange(data.delta);
+      }
+    });
+    newSocket.on('editor-change-ack',(data)=>{
+      console.log(data);
+    })
+    // 接收测试消息（用于调试）
+    newSocket.on('message', (data) => {
+      console.log('收到消息:', data);
+    });
+
+    // 连接错误
+    newSocket.on('connect_error', (error) => {
+      console.error('❌ Socket 连接错误:', error);
+      setConnectionStatus('error');
+      setIsEditorConnected(false);
+    });
+
+    // 断开连接
+    newSocket.on('disconnect', (reason) => {
+      console.warn('⚠️ Socket 断开连接:', reason);
+      setConnectionStatus('disconnected');
+      setIsEditorConnected(false);
+    });
+
+    newSocket.on('test-pong',(data)=>{
+      console.log(data)
+    })
+
+    newSocket.on('user-joined',(data)=>{
+      console.log(data);
+    });
+    newSocket.on('user-left',(data)=>{
+      console.log(data);
+    });
+    updateSocket(newSocket);
+
+    return () => {
+      if (newSocket) {
+        console.log('正在断开 Socket 连接...');
+        newSocket.disconnect();
+      }
+    };
+  }, []);
+
+  // **应用远程变化到编辑器**
+  const applyRemoteChange = useCallback((delta) => {
+    if (!quillInstanceRef.current) return;
+
+    try {
+      // 保存当前选区
+      const currentSelection = quillInstanceRef.current.getSelection();
+
+      // 应用远程变化
+      quillInstanceRef.current.updateContents(delta);
+
+      // 恢复选区（如果有）
+      if (currentSelection) {
+        quillInstanceRef.current.setSelection(currentSelection);
+      }
+
+      console.log('✅ 已应用远程变化');
+    } catch (error) {
+      console.error('❌ 应用远程变化失败:', error);
+    }
+  }, []);
+
+  // **发送编辑器变化到服务器**
+  const sendEditorChange = useCallback((delta, source) => {
+    if (!socketRef.current || source !== 'user' || !isEditorConnectedRef.current) {
+      console.log('发送失败');
+      return;
+    }
+
+    const changeData = {
+      type: 'editor-change',
+      delta: delta,
+      clientId: socketRef.current.id,
+      timestamp: new Date().toISOString()
+    };
+
+    console.log('📤 发送编辑器变化:', changeData);
+    socketRef.current.emit('editor-change', changeData);
+  }, []);
+
+  // 原有的更新统计函数
   const updateStats = useCallback(() => {
     if (!quillInstanceRef.current) return;
 
-    // 获取编辑器内容
     const editor = quillInstanceRef.current;
-
-
-    //从DOM直接获取文本内容
     const textContent = editor.root.textContent || '';
-
-    // 计算字符数（包括中文、英文、数字、标点）
     const charCount = textContent.length;
 
-    // 计算字数（中文通常按字计算）
-    // 移除所有空白字符和换行符
     const cleanText = textContent
-      .replace(/\s+/g, '')    // 移除所有空白
-      .replace(/\n/g, '')     // 移除换行
+      .replace(/\s+/g, '')
+      .replace(/\n/g, '')
       .trim();
 
-    // 字数 = 中文字符数 + 英文单词数（简化版）
     const chineseChars = (cleanText.match(/[\u4e00-\u9fa5]/g) || []).length;
     const englishText = cleanText.replace(/[\u4e00-\u9fa5]/g, ' ');
     const englishWords = englishText.split(/\s+/).filter(word => word.length > 0).length;
-
     const wordCount = chineseChars + englishWords;
 
     setWordCount(wordCount);
     setCharCount(charCount);
-
-    // 调试信息
-    console.log('统计详情:', {
-      textContent,
-      cleanText,
-      chineseChars,
-      englishWords,
-      wordCount,
-      charCount
-    });
   }, []);
 
-  // 初始化 Quill - 只依赖于必要的 ref，不依赖任何状态
+  // 初始化 Quill - 修改文本变化事件处理
   const initQuill = useCallback(async () => {
     if (quillInstanceRef.current || !editorRef.current) return;
 
     try {
       const Quill = (await import('quill')).default;
-
-      // 清空容器
       editorRef.current.innerHTML = '';
 
       // 创建容器结构
@@ -150,7 +278,7 @@ function SimpleEditor() {
           <span>S</span>
         </button>
       </div>
-      
+
       <div class="toolbar-group">
         <button type="button" class="ql-list" value="ordered" title="有序列表">
           <span>1.</span>
@@ -205,13 +333,12 @@ function SimpleEditor() {
       mainContainer.appendChild(container);
 
       editorRef.current.appendChild(mainContainer);
-
       // 初始化 Quill
       quillInstanceRef.current = new Quill(editorContainer, {
         theme: 'snow',
         modules: {
           toolbar: {
-            container: toolbarContainer, // 使用自定义工具栏容器
+            container: toolbarContainer,
             handlers: {
               image: function() {
                 ImageUploadHandler.clickHandler().then((imageUrl) => {
@@ -251,50 +378,30 @@ function SimpleEditor() {
         placeholder: '开始写作...',
         readOnly: false
       });
-      // 为自定义保存按钮添加事件
-      toolbarContainer.querySelector('.custom-save').addEventListener('click', () => {
-        if (quillInstanceRef.current) {
-          const content = quillInstanceRef.current.root.innerHTML;
-          console.log('保存内容:', content);
-          alert('内容已保存！');
-          // 这里可以调用保存 API
-        }
-      });
-      // ========== 优化事件监听 ==========
 
-      // 1. 创建防抖的文本变化处理器
-      const debouncedTextChange = debounce(() => {
-        if (!quillInstanceRef.current) return;
-
-        // 获取当前内容
-        const html = quillInstanceRef.current.root.innerHTML;
-
-        // 存储到 ref 而不是 state
-        contentRef.current = html;
+      // **文本变化监听器**
+      quillInstanceRef.current.on('text-change', (delta, oldDelta, source) => {
+        console.log('编辑器文本变化:', { delta, source });
 
         // 更新统计
         updateStats();
-      }, 300);
 
-      // 2. 添加事件监听器
-      quillInstanceRef.current.on('text-change', debouncedTextChange);
+        // **如果是用户操作
+        if (source === 'user' && socketRef.current) {
+          try{
+            sendEditorChange(delta,source);
+          }catch (error){
+            console.error('❌ 提交失败:', error);
+          }
+        }
+      });
 
-      // 3. 简化选区变化监听
+      // 简化选区变化监听
       quillInstanceRef.current.on('selection-change', (range) => {
         if (process.env.NODE_ENV === 'development' && range) {
           console.log('光标位置:', range);
         }
       });
-
-      // 设置初始内容
-      const initialContent = `
-        <h1>欢迎使用实时协作文本编辑器</h1>
-        <p>这是你的 <strong>毕业设计项目</strong> 的编辑器组件。</p>
-        <p>使用正确的 Quill 配置，避免重复工具栏问题。</p>
-        <p>现在工具栏只有一个，布局正常了！</p>
-      `;
-
-      quillInstanceRef.current.clipboard.dangerouslyPasteHTML(initialContent);
 
       // 初始统计
       updateStats();
@@ -302,44 +409,122 @@ function SimpleEditor() {
       // 标记初始化完成
       setIsInitialized(true);
 
-      if (process.env.NODE_ENV === 'development') {
-        console.log('✅ Quill 编辑器初始化成功');
-      }
+      console.log('✅ Quill 编辑器初始化成功，Socket 连接:', isEditorConnectedRef.current);
 
     } catch (error) {
       console.error('❌ Quill 初始化失败:', error);
     }
-  }, [updateStats]); // 只依赖于 updateStats
+  }, [updateStats]);
 
-  // 初始化 useEffect
+  // 🔌 **组件挂载时初始化**
   useEffect(() => {
+
+    // 先初始化 Socket
+    const cleanupSocket = initSocket();
+
+    // 然后初始化 Quill
     initQuill();
     setupChineseItalicSupport();
-    // 组件卸载时清理
+
     return () => {
+
+
+      //清理 Socket
+      if (socket) {
+        socket.disconnect();
+      }
+      cleanupSocket?.();
+
+      // 清理 Quill
       if (quillInstanceRef.current) {
-        // 移除事件监听器
         quillInstanceRef.current.off('text-change');
         quillInstanceRef.current.off('selection-change');
         quillInstanceRef.current = null;
+
       }
       setIsInitialized(false);
     };
-  }, [initQuill]);
-
-
+  }, [initSocket, initQuill]);
 
   return (
     <div className="simple-editor-container">
-      <div>
+      {/* 🔌 Socket 连接状态面板 */}
+      <div className="socket-panel">
+        <div className="socket-status">
+          <span className={`status-indicator ${connectionStatus}`}>
+            {connectionStatus === 'connected' ? '🟢' :
+              connectionStatus === 'disconnected' ? '🔴' : '🟡'}
+          </span>
+          <span className="status-text">
+            {connectionStatus === 'connected' ? '✅ 已连接到服务器' :
+              connectionStatus === 'disconnected' ? '❌ 未连接' : '⚠️ 连接错误'}
+            {socket && connectionStatus === 'connected' && ` (ID: ${socket.id.slice(0, 8)}...)`}
+          </span>
 
+          <div className="editor-status">
+            {isEditorConnected ? '📝 编辑器已同步' : '⏸️ 编辑器未同步'}
+          </div>
+        </div>
+
+        {/* 连接测试区域 */}
+        <div className="connection-test-area">
+          <div className="test-buttons">
+            <button
+              onClick={() => {
+                if (socket) {
+                  console.log('发送测试ping');
+                  socket.emit('test-ping', {
+                    message: '测试ping',
+                    timestamp: new Date().toISOString(),
+                  });
+                  //console.log('发送测试ping');
+                }
+              }}
+              disabled={!socket || connectionStatus !== 'connected'}
+              className="test-btn"
+            >
+              测试连接
+            </button>
+
+            <button
+              onClick={() => {
+                if (quillInstanceRef.current && socket) {
+                  const testText = '\n[测试] 这是一条测试消息，发送时间: ' + new Date().toLocaleTimeString();
+                  quillInstanceRef.current.insertText(quillInstanceRef.current.getLength(), testText);
+                  console.log('插入测试文本');
+                }
+              }}
+              disabled={!quillInstanceRef.current || !socket}
+              className="test-btn"
+            >
+              插入测试文本
+            </button>
+          </div>
+
+          {/* 连接信息 */}
+          <div className="connection-info">
+            <p>🔗 后端地址: <code>http://localhost:5000</code></p>
+            <p>📡 通信方式: WebSocket + HTTP 轮询</p>
+            <p>🔄 同步模式: ShareDB OT 协同编辑</p>
+            <p>📄 当前文档: test-doc-1</p>
+            <p>💡 提示: 打开两个浏览器窗口测试协同编辑</p>
+          </div>
+        </div>
       </div>
+
+      {/* 编辑器区域 */}
       <div ref={editorRef} className="quill-editor-wrapper"></div>
+
       <div className="editor-trailer">
         <div className="editor-stats">
           <span className="stat-item">字数: {wordCount}</span>
           <span className="stat-item">字符: {charCount}</span>
-          <span className="stat-item">状态: {isInitialized ? '✅ 已加载' : '🔄 加载中'}</span>
+          <span className="stat-item">
+            连接:
+            <span className={`connection-dot ${connectionStatus}`}></span>
+            {connectionStatus}
+          </span>
+          <span className="stat-item">同步: {isEditorConnected ? '开启' : '关闭'}</span>
         </div>
       </div>
     </div>
