@@ -3,10 +3,12 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import 'quill/dist/quill.snow.css';
 import './SimpleEditor.css';
 import {setupChineseItalicSupport} from '../utils/ChineseItalicSupport.js';
-import ShareDBClient from '../utils/sharedb-client';
-
+import { sharedbClient } from '../utils/sharedb-client';
+import CursorManager from '../utils/cursor-manager.js'   // 导入光标管理
 //导入socket.io-client
 import {io} from 'socket.io-client';
+import DocList from './DocList.jsx';
+
 
 
 // 自定义图片上传模块
@@ -49,6 +51,14 @@ const debounce = (func, wait) => {
 function SimpleEditor() {
   const editorRef = useRef(null);
   const quillInstanceRef = useRef(null);
+  const cursorManagerRef = useRef(null);// 光标管理器引用
+
+  // ✅ 当前文档ID状态（默认 richtext）
+  const [currentDocId, setCurrentDocId] = useState('richtext');
+
+  // ShareDB 状态
+  const [shareDBStatus, setShareDBStatus] = useState('disconnected');
+  const [isDocLoaded, setIsDocLoaded] = useState(false);
 
   //Socket 相关状态
   const socketRef = useRef(null);
@@ -62,6 +72,14 @@ function SimpleEditor() {
   const [wordCount, setWordCount] = useState(0);
   const [charCount, setCharCount] = useState(0);
   const [isInitialized, setIsInitialized] = useState(false);
+
+  // 当前用户信息
+  const [userInfo] = useState(()=>({
+    id:Math.random().toString().substr(2,9),
+    name:`用户${Math.floor(Math.random() * 1000)}`,
+    color:`hsl(${Math.random() * 360}, 70%, 50%)`
+  }));
+  const [onlineUsers,setOnlineUsers] = useState([]);
 
 
   const updateSocket = useCallback((socket) => {
@@ -82,8 +100,77 @@ function SimpleEditor() {
     console.log(`编辑器连接状态更新: ${connected} (ref: ${isEditorConnectedRef.current})`);
   }, []);
 
+  // ==================== ShareDB 连接====================
 
-  // **初始化 Socket 连接**
+  const initShareDB = useCallback(async (docId) => {
+    try{
+      console.log(`正在连接 ShareDB，文档: ${docId}`);
+    // 如果已有连接，先断开
+      sharedbClient.disconnect();
+      setIsDocLoaded(false);
+
+      //设置状态回调
+      sharedbClient.onStatusChange((status)=>{
+        console.log('ShareDB 状态:', status);
+        setShareDBStatus(status);
+      });
+
+      //设置内容变更回调（远程操作）
+      sharedbClient.onContentChange((op,source)=>{
+        console.log('📥 收到远程变更:', op);
+        console.log('📥 onContentChange 回调触发:', { op, source });
+
+
+        if(!quillInstanceRef.current) return;
+        const quill = quillInstanceRef.current;
+
+        // // 简化：只保存选区起点，应用后恢复近似位置
+        // const selection = quill.getSelection();
+        // const oldIndex = selection ? selection.index : 0;
+        // const oldLength = selection ? selection.length : 0;
+
+        try{
+          // 应用远程 Delta 到 Quill
+          // op 是数组格式，Quill 需要对象格式 { ops: [...] }
+          const delta = Array.isArray(op) ? {op:op} : op;
+          console.log('  应用 delta:', delta);
+          quill.updateContents(delta,'silent');// 'silent' 不触发 text-change
+          console.log('✅ Delta 已应用');
+
+          // // 简单恢复：保持原位（实际项目中可以用 quill-delta 库做精确变换）
+          // setTimeout(() => {
+          //   quill.setSelection(oldIndex, oldLength, 'silent');
+          // }, 0);
+
+          updateStats();
+        }catch (error){
+          console.error('❌ 应用远程变化失败:', error);
+        }
+      });
+
+      // 连接并订阅文档
+      const doc = await sharedbClient.connect(docId);
+      console.log('📄 文档连接成功:', doc.id);
+
+      //加载文档内容到Quill
+      if(quillInstanceRef.current && doc.data) {
+        // 清空并加载新文档内容
+        quillInstanceRef.current.setContents([{ insert: '\n' }], 'silent');
+
+        if (doc.data) {
+          quillInstanceRef.current.setContents(doc.data, 'silent');
+        }
+        setIsDocLoaded(true);
+        console.log(`✅ 文档 ${docId} 加载完成`);
+      }
+    }catch (error){
+      console.log('❌ ShareDB 连接失败:', error);
+    }
+  },[]);
+
+
+
+  // ==================== Socket.IO（保留用于通知）====================
   const initSocket = useCallback(() => {
     console.log('正在连接到 Socket.IO 服务器...');
 
@@ -104,21 +191,46 @@ function SimpleEditor() {
       // 发送编辑器就绪消息
       newSocket.emit('editor-ready', {
         clientId: newSocket.id,
-        type: 'editor',
+        userInfo: userInfo,
         timestamp: new Date().toISOString()
       });
     });
+    // ✅ 监听用户列表更新
+    newSocket.on('users-update',(users)=>{
+      console.log('👥 在线用户更新:', users);
+      setOnlineUsers(users.filter(u => u.id !== newSocket.id));
+    });
 
-    // 🔄 **接收编辑器内容变化**
-    newSocket.on('editor-change', (data) => {
-      console.log('📩 收到编辑器变化:', data);
-
-      // 应用变化到本地编辑器（如果不是本地触发的）
-      if (quillInstanceRef.current && data.clientId !== newSocket.id) {
-        console.log('应用远程变化到编辑器');
-        applyRemoteChange(data.delta);
+    // ✅ 监听远程光标位置
+    newSocket.on('cursor-update', (data) => {
+      if (data.clientId === newSocket.id) return; // 忽略自己
+      console.log("光标更新：",data);
+      if (cursorManagerRef.current) {
+        cursorManagerRef.current.updateCursor(
+          data.clientId,
+          data.range,
+          data.userInfo
+        );
       }
     });
+
+    // ✅ 用户离开，移除光标
+    newSocket.on('user-left', (data) => {
+      if (cursorManagerRef.current) {
+        cursorManagerRef.current.removeCursor(data.clientId);
+      }
+    });
+
+    // // 🔄 **接收编辑器内容变化**
+    // newSocket.on('editor-change', (data) => {
+    //   console.log('📩 收到编辑器变化:', data);
+    //
+    //   // 应用变化到本地编辑器（如果不是本地触发的）
+    //   if (quillInstanceRef.current && data.clientId !== newSocket.id) {
+    //     console.log('应用远程变化到编辑器');
+    //     applyRemoteChange(data.delta);
+    //   }
+    // });
     newSocket.on('editor-change-ack',(data)=>{
       console.log(data);
     })
@@ -148,9 +260,9 @@ function SimpleEditor() {
     newSocket.on('user-joined',(data)=>{
       console.log(data);
     });
-    newSocket.on('user-left',(data)=>{
-      console.log(data);
-    });
+    // newSocket.on('user-left',(data)=>{
+    //   console.log(data);
+    // });
     updateSocket(newSocket);
 
     return () => {
@@ -159,7 +271,22 @@ function SimpleEditor() {
         newSocket.disconnect();
       }
     };
-  }, []);
+  }, [userInfo]);
+
+  // ✅ 发送本地光标位置（防抖）
+  const sendCursorUpdate = useCallback(
+    debounce((range) => {
+      if (socketRef.current && range) {
+        socketRef.current.emit('cursor-update', {
+          clientId: socketRef.current.id,
+          userInfo: userInfo,
+          range: range,
+          timestamp: new Date().toISOString()
+        });
+      }
+    }, 50), // 50ms 防抖
+    [userInfo]
+  );
 
   // **应用远程变化到编辑器**
   const applyRemoteChange = useCallback((delta) => {
@@ -223,7 +350,7 @@ function SimpleEditor() {
     setCharCount(charCount);
   }, []);
 
-  // 初始化 Quill - 修改文本变化事件处理
+  // ==================== Quill 初始化====================
   const initQuill = useCallback(async () => {
     if (quillInstanceRef.current || !editorRef.current) return;
 
@@ -379,27 +506,30 @@ function SimpleEditor() {
         readOnly: false
       });
 
+      // 初始化光标管理器
+      cursorManagerRef.current = new CursorManager(quillInstanceRef.current);
+
       // **文本变化监听器**
       quillInstanceRef.current.on('text-change', (delta, oldDelta, source) => {
         console.log('编辑器文本变化:', { delta, source });
-
+        sendCursorUpdate(quillInstanceRef.current.getSelection());
         // 更新统计
         updateStats();
 
-        // **如果是用户操作
-        if (source === 'user' && socketRef.current) {
-          try{
-            sendEditorChange(delta,source);
-          }catch (error){
-            console.error('❌ 提交失败:', error);
+        // 用户操作时，提交到 ShareDB
+        if (source === 'user' ||  source === 'api') {
+          // delta 格式: { ops: [...] }，直接提交
+          const success = sharedbClient.submitOp(delta);
+          if(!success){
+            console.warn('⚠️ 操作提交失败，可能未连接');
           }
         }
       });
 
-      // 简化选区变化监听
-      quillInstanceRef.current.on('selection-change', (range) => {
-        if (process.env.NODE_ENV === 'development' && range) {
-          console.log('光标位置:', range);
+      // 选区变化监听
+      quillInstanceRef.current.on('selection-change', (range, oldRange, source) => {
+        if (source === 'user' && range) {
+          sendCursorUpdate(range);
         }
       });
 
@@ -414,27 +544,40 @@ function SimpleEditor() {
     } catch (error) {
       console.error('❌ Quill 初始化失败:', error);
     }
-  }, [updateStats]);
+  }, [updateStats,sendCursorUpdate]);
 
-  // 🔌 **组件挂载时初始化**
+  // ==================== 切换文档 ====================
+
+  // ✅ 切换文档处理
+  const handleSelectDoc = useCallback((docId) => {
+    if (docId === currentDocId) return;
+    console.log(`📄 切换文档: ${currentDocId} → ${docId}`);
+    setCurrentDocId(docId);
+    // 重新连接 ShareDB
+    initShareDB(docId);
+  }, [currentDocId, initShareDB]);
+
+  // ==================== 组件挂载====================
   useEffect(() => {
 
-    // 先初始化 Socket
-    const cleanupSocket = initSocket();
-
-    // 然后初始化 Quill
+    // 1. 先初始化 Quill
     initQuill();
     setupChineseItalicSupport();
 
+    // 2. 然后连接 ShareDB（编辑同步）
+    initShareDB();
+
+    // 3. Socket.IO（通知）
+    const cleanupSocket = initSocket();
+
     return () => {
-
-
-      //清理 Socket
+      //清理
       if (socket) {
         socket.disconnect();
       }
       cleanupSocket?.();
 
+      sharedbClient.disconnect(); // 断开 ShareDB
       // 清理 Quill
       if (quillInstanceRef.current) {
         quillInstanceRef.current.off('text-change');
@@ -443,73 +586,58 @@ function SimpleEditor() {
 
       }
       setIsInitialized(false);
+      setIsDocLoaded(false);
     };
-  }, [initSocket, initQuill]);
+  }, [initSocket ,initShareDB, initQuill]);
 
   return (
     <div className="simple-editor-container">
-      {/* 🔌 Socket 连接状态面板 */}
-      <div className="socket-panel">
+      {/* 顶部工具栏 */}
+      <div className="toolbar">
+        <DocList
+          currentDocId={currentDocId}
+          onSelectDoc={handleSelectDoc}
+        />
+
+        <div className="current-doc-info">
+          当前文档: <strong>{currentDocId}</strong>
+        </div>
+
         <div className="socket-status">
-          <span className={`status-indicator ${connectionStatus}`}>
-            {connectionStatus === 'connected' ? '🟢' :
-              connectionStatus === 'disconnected' ? '🔴' : '🟡'}
+          {/* ✅ ShareDB 连接状态 */}
+          <span className={`status-indicator ${shareDBStatus}`}>
+            {shareDBStatus === 'connected' ? '🟢' :
+              shareDBStatus === 'disconnected' ? '🔴' : '🟡'}
           </span>
           <span className="status-text">
-            {connectionStatus === 'connected' ? '✅ 已连接到服务器' :
-              connectionStatus === 'disconnected' ? '❌ 未连接' : '⚠️ 连接错误'}
-            {socket && connectionStatus === 'connected' && ` (ID: ${socket.id.slice(0, 8)}...)`}
+            ShareDB: {shareDBStatus === 'connected' ? '✅ 已同步' :
+            shareDBStatus === 'disconnected' ? '❌ 未连接' : '⚠️ 错误'}
+            {isDocLoaded && ' (文档已加载)'}
           </span>
-
-          <div className="editor-status">
-            {isEditorConnected ? '📝 编辑器已同步' : '⏸️ 编辑器未同步'}
-          </div>
         </div>
 
-        {/* 连接测试区域 */}
-        <div className="connection-test-area">
-          <div className="test-buttons">
-            <button
-              onClick={() => {
-                if (socket) {
-                  console.log('发送测试ping');
-                  socket.emit('test-ping', {
-                    message: '测试ping',
-                    timestamp: new Date().toISOString(),
-                  });
-                  //console.log('发送测试ping');
-                }
-              }}
-              disabled={!socket || connectionStatus !== 'connected'}
-              className="test-btn"
+        {/* 在线用户列表 */}
+        <div className="online-users">
+          {console.log('渲染 onlineUsers:', onlineUsers)}
+          {onlineUsers.length === 0 && <span style={{ color: '#999' }}>暂无其他用户</span>}
+          {onlineUsers.map(user => (
+            <span
+              key={user.id}
+              className="user-badge"
+              style={{ backgroundColor: user.color }}
             >
-              测试连接
-            </button>
-
-            <button
-              onClick={() => {
-                if (quillInstanceRef.current && socket) {
-                  const testText = '\n[测试] 这是一条测试消息，发送时间: ' + new Date().toLocaleTimeString();
-                  quillInstanceRef.current.insertText(quillInstanceRef.current.getLength(), testText);
-                  console.log('插入测试文本');
-                }
-              }}
-              disabled={!quillInstanceRef.current || !socket}
-              className="test-btn"
-            >
-              插入测试文本
-            </button>
-          </div>
-
-          {/* 连接信息 */}
-          <div className="connection-info">
-            <p>🔗 后端地址: <code>http://localhost:5000</code></p>
-            <p>📡 通信方式: WebSocket + HTTP 轮询</p>
-            <p>🔄 同步模式: ShareDB OT 协同编辑</p>
-            <p>📄 当前文档: test-doc-1</p>
-            <p>💡 提示: 打开两个浏览器窗口测试协同编辑</p>
-          </div>
+              {user.name}
+            </span>
+          ))}
         </div>
+
+        {/* 连接信息 */}
+        <div className="connection-info">
+          <p>📡 ShareDB: ws://localhost:5000/sharedb</p>
+          <p>💡 提示: 打开两个浏览器窗口测试协同编辑</p>
+          <p>🔄 同步模式: <strong>OT 协同编辑</strong></p>
+        </div>
+
       </div>
 
       {/* 编辑器区域 */}
@@ -520,11 +648,10 @@ function SimpleEditor() {
           <span className="stat-item">字数: {wordCount}</span>
           <span className="stat-item">字符: {charCount}</span>
           <span className="stat-item">
-            连接:
-            <span className={`connection-dot ${connectionStatus}`}></span>
-            {connectionStatus}
+            ShareDB:
+            <span className={`connection-dot ${shareDBStatus}`}></span>
+            {shareDBStatus}
           </span>
-          <span className="stat-item">同步: {isEditorConnected ? '开启' : '关闭'}</span>
         </div>
       </div>
     </div>

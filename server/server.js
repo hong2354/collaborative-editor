@@ -3,27 +3,94 @@ import express from 'express'
 import http from 'node:http';
 import { Server } from 'socket.io';
 import cors from 'cors'
-import ShareDB from 'sharedb'
-import richText from 'rich-text'
+import { WebSocketServer } from 'ws';
+import ShareDB from 'sharedb';
+import WebSocketJSONStream from '@teamwork/websocket-json-stream';
+import richText from 'rich-text';
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
+// ==================== ShareDB 配置 ====================
+const backend = new ShareDB();
+// 创建 ShareDB 连接（用于服务器端操作文档）
+const connection = backend.connect();
+ShareDB.types.register(richText.type);
+
+// ==================== ShareDB 服务器（端口 5001）====================
+const shareDBApp = express();
+const shareDBServer = http.createServer(shareDBApp);
+const shareDBWSS = new WebSocketServer({
+  server: shareDBServer,
+  path: '/sharedb'
+});
+
+shareDBWSS.on('connection', (ws,req) => {
+  console.log('📡 ShareDB WebSocket 连接:',req.socket.remoteAddress);
+  const stream = new WebSocketJSONStream(ws);
+  backend.listen(stream);
+
+  ws.on('close', () => console.log('🔌 ShareDB 断开'));
+});
+
+shareDBApp.use(cors());
+shareDBApp.get('/', (req, res) => {
+  res.json({ service: 'ShareDB', port: 5001 });
+});
+
+// 初始化示例文档
+async function initDocs() {
+  const doc = connection.get('examples', 'richtext');
+  try {
+    await new Promise((resolve, reject) => {
+      doc.fetch((err) => {
+        if (err) return reject(err);
+        if (doc.type === null) {
+          console.log('文档不存在')
+          // 文档不存在，创建初始内容
+          doc.create(
+            [{ insert: '\n' }],
+            'rich-text',
+            (err) => {
+              if (err) reject(err);
+              else resolve();
+            }
+          );
+        } else {
+          resolve();
+        }
+      });
+    });
+    console.log('✅ 示例文档初始化完成');
+  } catch (err) {
+    console.log('⚠️ 示例文档已存在或初始化跳过');
+  }
+}
+
+// // ==================== WebSocket 服务器（给 ShareDB 用） ====================
+// const wss = new WebSocketServer({
+//   server: server,  // 挂载在同一个 HTTP 服务器上
+//   path: '/sharedb' // WebSocket 路径：ws://localhost:5000/sharedb
+// });
+//
+// wss.on('connection', (ws, req) => {
+//   console.log('🔌 ShareDB WebSocket 连接:', req.socket.remoteAddress);
+//
+//   const stream = new WebSocketJSONStream(ws);
+//   backend.listen(stream);
+//
+//   ws.on('close', () => {
+//     console.log('🔌 ShareDB WebSocket 断开');
+//   });
+// });
+
+// ==================== Socket.IO 服务器（端口 5000）====================
+const mainApp = express();
+const mainServer = http.createServer(mainApp);
+const io = new Server(mainServer, {
   cors: {
     origin: "http://localhost:5173",
     methods: ["GET", "POST"]
   }
 });
 
-//创建 ShareDB 后端
-const backend = new ShareDB();
-
-//注册 rich-text 类型
-ShareDB.types.register(richText.type);
-
-
-// 启用 CORS
-app.use(cors());
 
 // 存储客户端信息
 const clients = new Map();
@@ -32,67 +99,73 @@ const clients = new Map();
 io.on('connection', (socket) => {
   console.log('🔌 新客户端连接:', socket.id);
 
-  // 创建 ShareDB 代理（Agent）来处理这个连接
-  const agent = backend.connect();
-
-  // 监听客户端发送的 ShareDB 消息
-  socket.on('share-db',(message)=>{
-    console.log('📩 收到 ShareDB 消息:', message);
-    agent.receive(message,(err)=>{
-      if(err){
-        console.error('❌ ShareDB 处理消息错误:', err);
-      }
-    });
-  });
-
-  // 将 ShareDB 的消息发送回客户端
-  const sendToClient = (message)=>{
-    socket.emit('share-db',message);
-  };
-  // 监听 ShareDB 代理的发送事件
-  agent.on('send',sendToClient);
-
-  // 存储客户端信息
-  clients.set(socket.id, {
-    id: socket.id,
-    connectedAt: new Date(),
-    type: 'unknown'
-  });
 
   // 📝 **编辑器就绪**
   socket.on('editor-ready', (data) => {
     console.log('📝 编辑器就绪:', socket.id);
-    clients.set(socket.id, { ...clients.get(socket.id), type: 'editor' });
 
-    // 通知其他客户端有新编辑器加入
+    clients.set(socket.id, {
+      id: socket.id,
+      userInfo: data.userInfo,
+      connectedAt: new Date()
+    });
+
+    // 广播用户列表
+    // ✅ 广播给所有客户端（包括自己）
+    const usersList = Array.from(clients.values()).map(c => ({
+      id: c.id,
+      name: c.userInfo?.name || '匿名',
+      color: c.userInfo?.color || '#999'
+    }));
+
+    console.log('👥 广播用户列表:', usersList);
+    io.emit('users-update', usersList);
+
     socket.broadcast.emit('user-joined', {
       clientId: socket.id,
-      type: 'editor',
-      timestamp: new Date().toISOString()
+      userInfo: data.userInfo
     });
   });
 
-  // 🔄 **处理编辑器内容变化**
-  socket.on('editor-change', (data) => {
-    console.log('📤 收到编辑器变化:', {
-      from: socket.id,
-      deltaLength: data.delta?.ops?.length || 0,
-      timestamp: data.timestamp
-    });
-
-    // 广播给其他所有客户端
-    socket.broadcast.emit('editor-change', {
-      ...data,
-      serverReceivedAt: new Date().toISOString()
-    });
-
-    // 调试：发送确认回执
-    socket.emit('editor-change-ack', {
-      status: 'received',
-      message: '变化已接收并广播',
-      timestamp: new Date().toISOString()
-    });
+  // ✅ 转发光标位置
+  socket.on('cursor-update', (data) => {
+    console.log("光标更新：",data);
+    socket.broadcast.emit('cursor-update', data);
   });
+
+  socket.on('disconnect', () => {
+    clients.delete(socket.id);
+    // 广播更新后的列表
+    const usersList = Array.from(clients.values()).map(c => ({
+      id: c.id,
+      name: c.userInfo?.name || '匿名',
+      color: c.userInfo?.color || '#999'
+    }));
+    io.emit('users-update', usersList);
+    socket.broadcast.emit('user-left', { clientId: socket.id });
+  });
+
+  // // 🔄 **处理编辑器内容变化**
+  // socket.on('editor-change', (data) => {
+  //   console.log('📤 收到编辑器变化:', {
+  //     from: socket.id,
+  //     deltaLength: data.delta?.ops?.length || 0,
+  //     timestamp: data.timestamp
+  //   });
+  //
+  //   // 广播给其他所有客户端
+  //   socket.broadcast.emit('editor-change', {
+  //     ...data,
+  //     serverReceivedAt: new Date().toISOString()
+  //   });
+  //
+  //   // 调试：发送确认回执
+  //   socket.emit('editor-change-ack', {
+  //     status: 'received',
+  //     message: '变化已接收并广播',
+  //     timestamp: new Date().toISOString()
+  //   });
+  // });
 
   // 🧪 **测试消息**
   socket.on('test-ping', (data) => {
@@ -149,8 +222,11 @@ io.on('connection', (socket) => {
   console.log('📊 当前连接数:', io.engine.clientsCount);
 });
 
-// 🛠️ **服务器状态 API**
-app.get('/api/status', (req, res) => {
+// ==================== Express 路由 ====================
+
+mainApp.use(cors());
+mainApp.use(express.json());
+mainApp.get('/api/status', (req, res) => {
   res.json({
     status: 'running',
     timestamp: new Date().toISOString(),
@@ -163,7 +239,7 @@ app.get('/api/status', (req, res) => {
 });
 
 // 🏠 **根路由**
-app.get('/', (req, res) => {
+mainApp.get('/', (req, res) => {
   res.json({
     message: '实时协作服务器正在运行',
     endpoints: {
@@ -175,9 +251,14 @@ app.get('/', (req, res) => {
 });
 
 // 🚀 **启动服务器**
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`🚀 服务器运行在 http://localhost:${PORT}`);
-  console.log(`📡 WebSocket 端点: ws://localhost:${PORT}`);
-  console.log(`📊 状态检查: http://localhost:${PORT}/api/status`);
+const SHAREDB_PORT = 5001;
+const MAIN_PORT = 5000;
+shareDBServer.listen(SHAREDB_PORT, () => {
+  console.log(`📡 ShareDB 运行在 ws://localhost:${SHAREDB_PORT}/sharedb`);
+  initDocs();
+});
+
+mainServer.listen(MAIN_PORT, () => {
+  console.log(`🚀 主服务器运行在 http://localhost:${MAIN_PORT}`);
+  console.log(`💬 Socket.IO 可用`);
 });
